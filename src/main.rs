@@ -9,7 +9,7 @@ use std::time::Duration;
 
 const DB_PATH: &str = "./seeds.db";
 const MAX_SEEDS: usize = 250_000;
-const LISTEN_URL: &str = "127.0.0.1:6666";
+const LISTEN_URL: &str = "127.0.0.1:43277";
 const WAIT_DURATION: Duration = Duration::from_millis(1_000);
 
 type DbResult<T> = Result<T, Box<dyn std::error::Error>>;
