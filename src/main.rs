@@ -1,77 +1,34 @@
+mod db;
 mod search;
 
-use once_cell::sync::Lazy;
 use rouille::Response;
-use rusqlite::Connection;
-use std::sync::Mutex;
+use serde::Serialize;
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
+
+use crate::db::Db;
+use crate::search::{search_game, search_sync};
 
 const DB_PATH: &str = "./seeds.db";
 const MAX_SEEDS: usize = 250_000;
 const LISTEN_URL: &str = "127.0.0.1:43277";
 const WAIT_DURATION: Duration = Duration::from_millis(1_000);
 
-type DbResult<T> = Result<T, Box<dyn std::error::Error>>;
-
-// Global database connection using once_cell
-static DB: Lazy<Mutex<Connection>> = Lazy::new(|| {
-    let db = Connection::open(DB_PATH).unwrap();
-    db.execute(
-        "CREATE TABLE IF NOT EXISTS seeds (seed TEXT PRIMARY KEY)",
-        [],
-    )
-    .unwrap();
-    Mutex::new(db)
-});
-
-// Get the total seeds
-fn get_seed_count() -> DbResult<usize> {
-    let db = DB.lock().map_err(|e| format!("Failed to lock DB: {}", e))?;
-    let count: usize = db.query_row("SELECT COUNT(*) FROM seeds", [], |row| row.get(0))?;
-    Ok(count)
+#[derive(Serialize)]
+struct SeedResponse {
+    seed: String,
+    kind: &'static str,
 }
 
-// Insert the seed into the db
-fn insert_seed(seed_hex: &str) -> DbResult<()> {
-    let db = DB.lock().map_err(|e| format!("Failed to lock DB: {}", e))?;
-    db.execute("INSERT OR IGNORE INTO seeds VALUES (?)", [seed_hex])?;
-    Ok(())
-}
-
-// Tries to insert the seed, returning `true` if successful and `false` if the limit is reached
-fn insert_seed_with_limit(seed_hex: &str) -> DbResult<bool> {
-    let seed_count = get_seed_count()?;
-    if seed_count >= MAX_SEEDS {
-        return Ok(false);
-    }
-    insert_seed(seed_hex)?;
-    Ok(true)
-}
-
-// Get a seed from the db without replacement, if one exists
-fn fetch_and_delete_seed() -> DbResult<Option<String>> {
-    let mut db = DB.lock().map_err(|e| format!("Failed to lock DB: {}", e))?;
-    let tx = db.transaction()?;
-
-    let seed_hex: Option<String> =
-        tx.query_row("SELECT seed FROM seeds LIMIT 1", [], |row| row.get(0))?;
-
-    if let Some(ref seed) = seed_hex {
-        tx.execute("DELETE FROM seeds WHERE seed = ?", [seed])?;
-    }
-
-    tx.commit()?;
-    Ok(seed_hex)
-}
-
-fn handle_seed_request() -> Response {
+fn handle_seed_request(db: &Arc<Db>, is_sync: bool) -> Response {
     loop {
-        match fetch_and_delete_seed() {
+        match db.fetch_and_delete_seed(is_sync) {
             Ok(Some(seed_hex)) => {
-                return Response::json(&serde_json::json!({
-                    "seed": seed_hex
-                }));
+                return Response::json(&SeedResponse {
+                    seed: seed_hex,
+                    kind: if is_sync { "sync" } else { "game" },
+                });
             }
             Ok(None) => {
                 // No seeds available, wait and retry
@@ -85,42 +42,48 @@ fn handle_seed_request() -> Response {
     }
 }
 
-fn main() {
-    // Calculate generator threads (1/3 of system threads)
-    let generator_threads = std::thread::available_parallelism()
-        .map(|n| n.get() / 3)
-        .unwrap_or(1)
-        .max(1);
+fn spawn_search_thread(name: &'static str, db: Arc<Db>, is_sync: bool) {
+    thread::spawn(move || {
+        println!("Starting {} seed generator thread", name);
 
-    // Spawn seed generators
-    for thread_id in 0..generator_threads {
-        thread::spawn(move || {
+        loop {
+            let seed = if is_sync {
+                search_sync()
+            } else {
+                search_game()
+            };
+            let seed_hex = hex::encode(seed);
+
             loop {
-                let seed = search::search();
-                let seed_hex = hex::encode(seed);
-
-                loop {
-                    match insert_seed_with_limit(&seed_hex) {
-                        Ok(true) => break, // success
-                        Ok(false) => {}    // no errors, but limit reached
-                        Err(e) => eprintln!("thread {} had error inserting seed: {}", thread_id, e),
-                    }
-                    // Wait before trying again
-                    thread::sleep(WAIT_DURATION);
+                match db.insert_seed_with_limit(&seed_hex, MAX_SEEDS, is_sync) {
+                    Ok(true) => break, // success
+                    Ok(false) => {}    // no errors, but limit reached
+                    Err(e) => eprintln!("{} generator error inserting seed: {}", name, e),
                 }
+                // Wait before trying again
+                thread::sleep(WAIT_DURATION);
             }
-        });
-    }
+        }
+    });
+}
 
-    println!(
-        "Server listening on http://{} with {} generator threads",
-        LISTEN_URL, generator_threads
-    );
+fn main() {
+    // Initialize the database
+    let db = Arc::new(Db::new(DB_PATH));
+
+    println!("Server listening on http://{}", LISTEN_URL);
+
+    // Spawn one thread for game seeds
+    spawn_search_thread("game", db.clone(), false);
+
+    // Spawn one thread for sync seeds
+    spawn_search_thread("sync", db.clone(), true);
 
     // Start web server
-    rouille::start_server(LISTEN_URL, |request| {
+    rouille::start_server(LISTEN_URL, move |request| {
         match (request.method(), request.url().as_str()) {
-            ("POST", "/seed") => handle_seed_request(),
+            ("POST", "/seed/game") => handle_seed_request(&db, false),
+            ("POST", "/seed/sync") => handle_seed_request(&db, true),
             _ => Response::empty_404(),
         }
     });
