@@ -21,6 +21,12 @@ struct SeedResponse {
     kind: &'static str,
 }
 
+#[derive(Serialize)]
+struct StatsResponse {
+    game_seeds: usize,
+    sync_seeds: usize,
+}
+
 fn handle_seed_request(db: &Arc<Db>, is_sync: bool) -> Response {
     loop {
         match db.fetch_and_delete_seed(is_sync) {
@@ -38,6 +44,19 @@ fn handle_seed_request(db: &Arc<Db>, is_sync: bool) -> Response {
                 eprintln!("Database operation failed: {}", e);
                 thread::sleep(WAIT_DURATION);
             }
+        }
+    }
+}
+
+fn handle_stats_request(db: &Arc<Db>) -> Response {
+    match (db.get_seed_count(false), db.get_seed_count(true)) {
+        (Ok(game_seeds), Ok(sync_seeds)) => Response::json(&StatsResponse {
+            game_seeds,
+            sync_seeds,
+        }),
+        _ => {
+            eprintln!("Failed to get seed counts");
+            Response::text("Internal server error").with_status_code(500)
         }
     }
 }
@@ -84,6 +103,7 @@ fn main() {
         match (request.method(), request.url().as_str()) {
             ("POST", "/seed/game") => handle_seed_request(&db, false),
             ("POST", "/seed/sync") => handle_seed_request(&db, true),
+            ("GET", "/stats") => handle_stats_request(&db),
             _ => Response::empty_404(),
         }
     });
